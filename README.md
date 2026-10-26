@@ -169,9 +169,33 @@ optional:
   --probe-only           Only check if target is vulnerable, don't exploit
   --no-verify            Skip SSL certificate verification
   --cafile FILE          CA certificate file for SSL verification
+  --proxy URL            Send all HTTP(S) traffic through an intercepting proxy
+  --caido                Shorthand for --proxy http://127.0.0.1:8080
   -i, --interactive      Drop to interactive shell on success
   --callback URL         Blind callback URL (exfiltrate output via HTTP)
 ```
+
+### Logging the run through a proxy
+
+Route every request through Caido, Burp or any forward proxy, so the whole
+chain lands in the HTTP history as engagement evidence:
+
+```bash
+# plain HTTP target
+python3 poc.py http://target/index.php "id" --caido
+
+# https target: the proxy terminates TLS, so it needs its CA trusted
+python3 poc.py https://target/index.php "id" --caido --cafile caido_ca.pem
+```
+
+Export the CA from Caido under *Settings > CA Certificate > Export*, or pass
+`--no-verify` to skip verification entirely (lab only — it disables MITM
+protection against anyone else on the path).
+
+Covers both the urllib requests and the raw-socket race traffic: plain HTTP
+goes out in absolute-URI form, https through a `CONNECT` tunnel. The FastCGI
+stage speaks raw FastCGI to php-fpm, not HTTP, so it bypasses the proxy and
+will not appear in the history.
 
 ### Lab (Apache + LFI)
 

